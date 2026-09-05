@@ -13,6 +13,7 @@
     "DOC_VERSION": "2026-09-05",
     "SCORE_THRESHOLD_MIN": 0.62,
     "SCORE_THRESHOLD_ANSWER": 0.67,
-    "ALLOWED_ORIGIN": "https://ksaiku.github.io"
+    "ALLOWED_ORIGIN": "https://ksaiku.github.io",
+    "TOP_K": 15
   }
 }
