@@ -436,15 +436,22 @@ export default {
       // 5-2手順7：後処理・検証
       const answerText = generation.text.trim();
 
-      if (answerText.length === 0 || answerText.includes("分かりません")) {
+      if (answerText.length === 0) {
         return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
       const citedNumbers = new Set(Array.from(answerText.matchAll(/\[(\d+)\]/g)).map((m) => Number(m[1])));
       const usedRefs = refs.filter((r) => citedNumbers.has(r.n));
 
-      if (usedRefs.length === 0) {
-        // 出典が1つも使われていない＝根拠不明のため、安全側で「分かりません」に正規化（7-2）。
+      // 11-28修正：「分かりません」の文字列一致による判定は廃止した。項目8（11-24対策B）により、
+      // 複合質問では「答えられる項目は答え、答えられない項目だけ資料に無い旨を明示する」正しい
+      // 部分回答が「分かりません」を含むことが設計上の正常系になったため、この判定は
+      // 正しい部分回答まで握りつぶしてしまっていた（E47・E49）。
+      // 唯一の門番は「有効な引用[n]が1つも無いか」に一本化する。モデルが純粋な拒否文だけを
+      // 返した場合は[n]が付かないため、これで従来どおり拒否として捕捉できる。
+      // 加えて、回答が定型拒否文（ルール3の一文）そのもので始まる場合は、たとえ引用が
+      // 残っていても no_answer: true として正規化し、表示のねじれ（回答文と出典欄の不一致）を防ぐ。
+      if (usedRefs.length === 0 || answerText.startsWith(NO_ANSWER_MESSAGE)) {
         return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
