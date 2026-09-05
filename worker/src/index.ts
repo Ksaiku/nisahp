@@ -385,6 +385,15 @@ export default {
         return chatError("現在、検索でエラーが発生しました。時間をおいて再度お試しください。");
       }
 
+      // 11-27(1)対応：初回デプロイ直後に観測された一過性の誤動作の再発時に原因を
+      // 追えるよう、工程8のあいだ検索上位3件を記録する。
+      console.log(
+        JSON.stringify({
+          event: "search_top3",
+          top3: matches.slice(0, 3).map((m) => ({ id: m.id, score: m.score })),
+        })
+      );
+
       // 対象範囲外チャンク（11-18対策）：最上位が is_scope_notice なら、
       // 閾値判定より前にLLMを呼ばず案内文を返す。対象範囲外チャンクは【参考資料】として扱わない。
       const top = matches[0];
