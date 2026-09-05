@@ -164,6 +164,22 @@ export default {
         );
       }
 
+      // 対象範囲外チャンク（11-18対策）：最上位が is_scope_notice なら、
+      // 閾値判定より前にLLMを呼ばず案内文を返す。対象範囲外チャンクは【参考資料】として扱わない。
+      const top = matches[0];
+      if (top?.metadata?.is_scope_notice === true) {
+        const scopeText = String(top.metadata.text ?? "");
+        return jsonResponse(
+          {
+            answer: `${scopeText} 金融庁のNISA特設サイト（https://www.fsa.go.jp/policy/nisa2/）をご確認ください。`,
+            sources: [],
+            no_answer: true,
+            error: false,
+          },
+          200
+        );
+      }
+
       // 5-2手順4：閾値判定（5-3・7-1）。
       const adopted = matches.filter((m) => m.score >= env.SCORE_THRESHOLD_MIN);
       const topScore = matches.length > 0 ? matches[0].score : 0;
