@@ -34,6 +34,9 @@ interface Env {
   // 5-3・付録Bと同じ値を保つこと。変更する場合はここではなく wrangler.jsonc の vars を編集する。
   SCORE_THRESHOLD_MIN: number;
   SCORE_THRESHOLD_ANSWER: number;
+  // CORSで許可する唯一のオリジン（5-1・リスク表#10/#12）。GitHub PagesのURLが
+  // 確定したら工程7でこの値を確定・差し替える。ワイルドカードは使わない。
+  ALLOWED_ORIGIN: string;
 }
 
 interface IngestChunk {
@@ -76,6 +79,13 @@ interface ReferenceChunk {
   text: string;
 }
 
+interface SourceEntry {
+  n: number[];
+  title: string;
+  url: string;
+  as_of: string;
+}
+
 const TOP_K = 5;
 const MAX_QUESTION_LENGTH = 500;
 const MAX_REFERENCE_CHARS = 3000;
@@ -105,15 +115,20 @@ const SYSTEM_PROMPT = `あなたは、金融庁の「NISA特設サイト」に�
 - 根拠にした【参考資料】の番号を、該当箇所の直後に [1] のように付けてください。
 - 参考資料が古い制度・改正前の内容に見える場合は、その内容は使わず、ルール3の一文を返してください。`;
 
-function jsonResponse(body: unknown, status: number): Response {
+function jsonResponse(body: unknown, status: number, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
   });
 }
 
-function errorResponse(answer: string): Response {
-  return jsonResponse({ error: true, answer, sources: [], no_answer: false }, 200);
+// 5-1・リスク表#10/#12：許可オリジンは1つだけ。ワイルドカードは使わない。
+function corsHeaders(env: Env): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
 }
 
 // 制御文字（コードポイント0x20未満、および0x7F）を除去する。
@@ -221,23 +236,46 @@ function buildUserPrompt(question: string, refs: ReferenceChunk[]): string {
   return `【参考資料】\n${refBlock}\n\n【質問】\n${question}`;
 }
 
+// 5-2手順7：sources を url で重複排除する（11-23対策②）。
+// チャンク再設計によりFSAチャンクは少数のURLしか持たないため、複数チャンクを採用すると
+// 同じURLが繰り返されやすい。本文の[n]との対応を保つため、同一URLのnは配列にまとめる。
+function dedupeSources(usedRefs: ReferenceChunk[]): SourceEntry[] {
+  const byUrl = new Map<string, SourceEntry>();
+  for (const r of usedRefs) {
+    const existing = byUrl.get(r.url);
+    if (existing) {
+      existing.n.push(r.n);
+    } else {
+      byUrl.set(r.url, { n: [r.n], title: r.title, url: r.url, as_of: r.asOf });
+    }
+  }
+  return Array.from(byUrl.values());
+}
+
 // 万一モデルが思考タグを本文に混入させた場合の保険的除去（6-3・リスク表#20）。
 function stripThinkTags(text: string): string {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
-function extractGeneratedText(result: ChatCompletionResult): string | null {
+type AnswerFieldSource = "response" | "content" | "reasoning";
+
+interface ExtractedAnswer {
+  text: string;
+  fieldSource: AnswerFieldSource;
+}
+
+function extractGeneratedText(result: ChatCompletionResult): ExtractedAnswer | null {
   if (typeof result?.response === "string" && result.response.trim().length > 0) {
-    return stripThinkTags(result.response);
+    return { text: stripThinkTags(result.response), fieldSource: "response" };
   }
   const message = result?.choices?.[0]?.message;
   if (typeof message?.content === "string" && message.content.trim().length > 0) {
-    return stripThinkTags(message.content);
+    return { text: stripThinkTags(message.content), fieldSource: "content" };
   }
   // Qwen3の思考モード無効化時、本文がcontentではなくreasoning側に入ることがある（実測で確認済み）。
   const reasoning = message?.reasoning_content ?? message?.reasoning;
   if (typeof reasoning === "string" && reasoning.trim().length > 0) {
-    return stripThinkTags(reasoning);
+    return { text: stripThinkTags(reasoning), fieldSource: "reasoning" };
   }
   return null;
 }
@@ -266,8 +304,13 @@ async function generateAnswer(env: Env, userPrompt: string): Promise<GenerationO
       }),
       GENERATION_TIMEOUT_MS
     )) as ChatCompletionResult;
-    const text = extractGeneratedText(result);
-    if (text) return { text, quotaExceeded: false };
+    const extracted = extractGeneratedText(result);
+    if (extracted) {
+      // 11-23残存リスク対策：reasoning由来の回答は、思考モードが何らかの理由で
+      // 有効化された場合に思考過程を回答として返す恐れがあるため、工程8で目視確認できるよう記録する。
+      console.log(JSON.stringify({ event: "generation_field_source", model: env.PRIMARY_MODEL, fieldSource: extracted.fieldSource }));
+      return { text: extracted.text, quotaExceeded: false };
+    }
   } catch (err) {
     if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true };
   }
@@ -277,8 +320,11 @@ async function generateAnswer(env: Env, userPrompt: string): Promise<GenerationO
       env.AI.run(env.FALLBACK_MODEL, { messages, temperature: 0.2, max_tokens: 512 }),
       GENERATION_TIMEOUT_MS
     )) as ChatCompletionResult;
-    const text = extractGeneratedText(result);
-    if (text) return { text, quotaExceeded: false };
+    const extracted = extractGeneratedText(result);
+    if (extracted) {
+      console.log(JSON.stringify({ event: "generation_field_source", model: env.FALLBACK_MODEL, fieldSource: extracted.fieldSource }));
+      return { text: extracted.text, quotaExceeded: false };
+    }
   } catch (err) {
     if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true };
   }
@@ -290,12 +336,28 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname === "/api/chat" && request.method === "OPTIONS") {
+      // CORSプリフライト（5-1・11-23対策①）。
+      return new Response(null, { status: 204, headers: corsHeaders(env) });
+    }
+
     if (url.pathname === "/api/chat" && request.method === "POST") {
+      const cors = corsHeaders(env);
+      const chatResponse = (chatBody: unknown, status: number) => jsonResponse(chatBody, status, cors);
+      const chatError = (answer: string) => chatResponse({ error: true, answer, sources: [], no_answer: false }, 200);
+
+      // Originが許可値と一致しない場合は403（リスク表#10/#12）。
+      // Originヘッダ自体が無いリクエスト（ブラウザ以外からの直接呼び出し・同一オリジン）は通す。
+      const origin = request.headers.get("Origin");
+      if (origin && origin !== env.ALLOWED_ORIGIN) {
+        return new Response(null, { status: 403 });
+      }
+
       let body: unknown;
       try {
         body = await request.json();
       } catch {
-        return jsonResponse(
+        return chatResponse(
           { error: true, answer: "質問は1〜500文字で入力してください。", no_answer: false, sources: [] },
           400
         );
@@ -304,7 +366,7 @@ export default {
       const questionRaw = (body as { question?: unknown })?.question;
       const validated = validateQuestion(questionRaw);
       if (!validated.ok) {
-        return jsonResponse(
+        return chatResponse(
           { error: true, answer: "質問は1〜500文字で入力してください。", no_answer: false, sources: [] },
           400
         );
@@ -313,13 +375,13 @@ export default {
       // 5-2手順2
       const vector = await embedQuestion(env, validated.question);
       if (!vector) {
-        return errorResponse("現在、検索の準備でエラーが発生しました。時間をおいて再度お試しください。");
+        return chatError("現在、検索の準備でエラーが発生しました。時間をおいて再度お試しください。");
       }
 
       // 5-2手順3
       const matches = await queryVectors(env, vector);
       if (!matches) {
-        return errorResponse("現在、検索でエラーが発生しました。時間をおいて再度お試しください。");
+        return chatError("現在、検索でエラーが発生しました。時間をおいて再度お試しください。");
       }
 
       // 対象範囲外チャンク（11-18対策）：最上位が is_scope_notice なら、
@@ -327,7 +389,7 @@ export default {
       const top = matches[0];
       if (top?.metadata?.is_scope_notice === true) {
         const scopeText = String(top.metadata.text ?? "");
-        return jsonResponse(
+        return chatResponse(
           {
             answer: `${scopeText} 金融庁のNISA特設サイト（https://www.fsa.go.jp/policy/nisa2/）をご確認ください。`,
             sources: [],
@@ -344,7 +406,7 @@ export default {
       const isNoAnswer = matches.length === 0 || adopted.length === 0 || topScore < env.SCORE_THRESHOLD_ANSWER;
 
       if (isNoAnswer) {
-        return jsonResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
+        return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
       // 5-2手順5：プロンプト組み立て
@@ -355,17 +417,17 @@ export default {
       const generation = await generateAnswer(env, userPrompt);
 
       if (generation.quotaExceeded) {
-        return errorResponse(QUOTA_EXCEEDED_MESSAGE);
+        return chatError(QUOTA_EXCEEDED_MESSAGE);
       }
       if (!generation.text) {
-        return errorResponse(GENERATION_FAILED_MESSAGE);
+        return chatError(GENERATION_FAILED_MESSAGE);
       }
 
       // 5-2手順7：後処理・検証
       const answerText = generation.text.trim();
 
       if (answerText.length === 0 || answerText.includes("分かりません")) {
-        return jsonResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
+        return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
       const citedNumbers = new Set(Array.from(answerText.matchAll(/\[(\d+)\]/g)).map((m) => Number(m[1])));
@@ -373,13 +435,13 @@ export default {
 
       if (usedRefs.length === 0) {
         // 出典が1つも使われていない＝根拠不明のため、安全側で「分かりません」に正規化（7-2）。
-        return jsonResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
+        return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
-      const sources = usedRefs.map((r) => ({ n: r.n, title: r.title, url: r.url, as_of: r.asOf }));
+      const sources = dedupeSources(usedRefs);
 
       // 5-2手順8：応答
-      return jsonResponse({ answer: answerText, sources, no_answer: false, error: false }, 200);
+      return chatResponse({ answer: answerText, sources, no_answer: false, error: false }, 200);
     }
 
     // 準備用・1回限りの投入ルート（4-1改訂版）。
