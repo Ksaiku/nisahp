@@ -1,5 +1,9 @@
+interface Ai {
+  run(model: string, input: unknown): Promise<unknown>;
+}
+
 interface Env {
-  AI: unknown;
+  AI: Ai;
   VECTORIZE: unknown;
   EMBEDDING_MODEL: string;
   PRIMARY_MODEL: string;
