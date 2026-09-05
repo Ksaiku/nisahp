@@ -39,6 +39,7 @@ interface Env {
 interface IngestChunk {
   id: string;
   text: string;
+  assumed_questions?: string[];
   metadata: Record<string, unknown>;
 }
 
@@ -201,8 +202,15 @@ export default {
         return jsonResponse({ error: true, message: "チャンク配列が空です。" }, 400);
       }
 
-      const texts = chunks.map((c) => c.text);
-      const embedding = (await env.AI.run(env.EMBEDDING_MODEL, { text: texts })) as EmbeddingResult;
+      // 埋め込む文字列＝【想定される質問】(検索の橋渡し用・11-15対策B) + 原文。
+      // metadata.text（LLMに渡す本文）には想定される質問を含めない。
+      const embeddingTexts = chunks.map((c) => {
+        const prefix = c.assumed_questions?.length
+          ? `【想定される質問】${c.assumed_questions.join("／")}\n`
+          : "";
+        return prefix + c.text;
+      });
+      const embedding = (await env.AI.run(env.EMBEDDING_MODEL, { text: embeddingTexts })) as EmbeddingResult;
 
       if (!embedding.data || embedding.data.length !== chunks.length) {
         return jsonResponse({ error: true, message: "埋め込み結果の件数がチャンク数と一致しません。" }, 500);
@@ -211,7 +219,8 @@ export default {
       const vectors: VectorizeVector[] = chunks.map((c, i) => ({
         id: c.id,
         values: embedding.data[i],
-        metadata: c.metadata,
+        // metadata.text に原文本体を同梱する（2-3・3-4：Workersは実行時にファイルを読めないため）。
+        metadata: { ...c.metadata, text: c.text },
       }));
 
       const upsertResult = await env.VECTORIZE.upsert(vectors);
