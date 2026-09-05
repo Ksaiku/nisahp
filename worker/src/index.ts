@@ -43,13 +43,6 @@ interface Env {
   TOP_K: number;
 }
 
-interface IngestChunk {
-  id: string;
-  text: string;
-  assumed_questions?: string[];
-  metadata: Record<string, unknown>;
-}
-
 interface EmbeddingResult {
   shape: number[];
   data: number[][];
@@ -452,41 +445,10 @@ export default {
       return chatResponse({ answer: answerText, sources, no_answer: false, error: false }, 200);
     }
 
-    // 準備用・1回限りの投入ルート（4-1改訂版）。
-    // wrangler deploy では絶対に公開しないこと。`wrangler dev --remote` でのみ使う想定
-    // （localhostからしか届かないため秘密トークンは不要）。投入完了後、工程9で削除する。
-    if (url.pathname === "/admin/ingest" && request.method === "POST") {
-      const chunks = (await request.json()) as IngestChunk[];
-
-      if (!Array.isArray(chunks) || chunks.length === 0) {
-        return jsonResponse({ error: true, message: "チャンク配列が空です。" }, 400);
-      }
-
-      // 埋め込む文字列＝【想定される質問】(検索の橋渡し用・11-15対策B) + 原文。
-      // metadata.text（LLMに渡す本文）には想定される質問を含めない。
-      const embeddingTexts = chunks.map((c) => {
-        const prefix = c.assumed_questions?.length
-          ? `【想定される質問】${c.assumed_questions.join("／")}\n`
-          : "";
-        return prefix + c.text;
-      });
-      const embedding = (await env.AI.run(env.EMBEDDING_MODEL, { text: embeddingTexts })) as EmbeddingResult;
-
-      if (!embedding.data || embedding.data.length !== chunks.length) {
-        return jsonResponse({ error: true, message: "埋め込み結果の件数がチャンク数と一致しません。" }, 500);
-      }
-
-      const vectors: VectorizeVector[] = chunks.map((c, i) => ({
-        id: c.id,
-        values: embedding.data[i],
-        // metadata.text に原文本体を同梱する（2-3・3-4：Workersは実行時にファイルを読めないため）。
-        metadata: { ...c.metadata, text: c.text },
-      }));
-
-      const upsertResult = await env.VECTORIZE.upsert(vectors);
-
-      return jsonResponse({ inserted: vectors.length, mutation: upsertResult }, 200);
-    }
+    // /admin/ingest は工程9を待たず削除済み（11-25：最初の wrangler deploy より前に
+    // 削除する必要があったため前倒し）。再投入が必要な場合は、このファイルの過去のコミット
+    // （例：7e45ad5 時点）から該当ブロックを一時的に戻し、`wrangler dev --remote` でのみ実行する。
+    // デプロイ版に投入経路を残さない。
 
     return new Response("Not Found", { status: 404 });
   },
