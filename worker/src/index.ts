@@ -281,9 +281,14 @@ function extractGeneratedText(result: ChatCompletionResult): ExtractedAnswer | n
   return null;
 }
 
+type ModelUsed = "primary" | "fallback";
+
 interface GenerationOutcome {
   text: string | null;
   quotaExceeded: boolean;
+  // 11-30(5)：どちらのモデルが実際に応答を返したかを、後段の診断ログのために保持する。
+  modelUsed: ModelUsed | null;
+  fieldSource: AnswerFieldSource | null;
 }
 
 // 5-2手順6：回答生成。primary失敗時はfallbackで1回だけ再生成（7-2）。
@@ -307,13 +312,10 @@ async function generateAnswer(env: Env, userPrompt: string): Promise<GenerationO
     )) as ChatCompletionResult;
     const extracted = extractGeneratedText(result);
     if (extracted) {
-      // 11-23残存リスク対策：reasoning由来の回答は、思考モードが何らかの理由で
-      // 有効化された場合に思考過程を回答として返す恐れがあるため、工程8で目視確認できるよう記録する。
-      console.log(JSON.stringify({ event: "generation_field_source", model: env.PRIMARY_MODEL, fieldSource: extracted.fieldSource }));
-      return { text: extracted.text, quotaExceeded: false };
+      return { text: extracted.text, quotaExceeded: false, modelUsed: "primary", fieldSource: extracted.fieldSource };
     }
   } catch (err) {
-    if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true };
+    if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true, modelUsed: null, fieldSource: null };
   }
 
   try {
@@ -323,14 +325,13 @@ async function generateAnswer(env: Env, userPrompt: string): Promise<GenerationO
     )) as ChatCompletionResult;
     const extracted = extractGeneratedText(result);
     if (extracted) {
-      console.log(JSON.stringify({ event: "generation_field_source", model: env.FALLBACK_MODEL, fieldSource: extracted.fieldSource }));
-      return { text: extracted.text, quotaExceeded: false };
+      return { text: extracted.text, quotaExceeded: false, modelUsed: "fallback", fieldSource: extracted.fieldSource };
     }
   } catch (err) {
-    if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true };
+    if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true, modelUsed: null, fieldSource: null };
   }
 
-  return { text: null, quotaExceeded: false };
+  return { text: null, quotaExceeded: false, modelUsed: null, fieldSource: null };
 }
 
 export default {
@@ -436,23 +437,41 @@ export default {
       // 5-2手順7：後処理・検証
       const answerText = generation.text.trim();
 
-      if (answerText.length === 0) {
-        return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
-      }
-
       const citedNumbers = new Set(Array.from(answerText.matchAll(/\[(\d+)\]/g)).map((m) => Number(m[1])));
       const usedRefs = refs.filter((r) => citedNumbers.has(r.n));
+
+      // 11-30(5)：根本原因特定のための計測。生成のたびに使用モデル・取得元フィールド・
+      // 抽出できた引用番号の個数を記録する。
+      console.log(
+        JSON.stringify({
+          event: "generation_diagnostics",
+          model: generation.modelUsed,
+          fieldSource: generation.fieldSource,
+          citationCount: citedNumbers.size,
+          usedRefsCount: usedRefs.length,
+        })
+      );
 
       // 11-28修正：「分かりません」の文字列一致による判定は廃止した。項目8（11-24対策B）により、
       // 複合質問では「答えられる項目は答え、答えられない項目だけ資料に無い旨を明示する」正しい
       // 部分回答が「分かりません」を含むことが設計上の正常系になったため、この判定は
       // 正しい部分回答まで握りつぶしてしまっていた（E47・E49）。
-      // 唯一の門番は「有効な引用[n]が1つも無いか」に一本化する。モデルが純粋な拒否文だけを
-      // 返した場合は[n]が付かないため、これで従来どおり拒否として捕捉できる。
-      // 加えて、回答が定型拒否文（ルール3の一文）そのもので始まる場合は、たとえ引用が
-      // 残っていても no_answer: true として正規化し、表示のねじれ（回答文と出典欄の不一致）を防ぐ。
-      if (usedRefs.length === 0 || answerText.startsWith(NO_ANSWER_MESSAGE)) {
+      //
+      // 11-30改訂（設計側の欠陥⑨の是正）：この後処理に到達した時点で、直前の isNoAnswer 判定により
+      // adopted.length > 0 かつ topScore >= SCORE_THRESHOLD_ANSWER（＝資料はあり、LLMも呼んだ）
+      // ことが既に保証されている。そのため、ここでの「引用ゼロ」は「資料に無い」のではなく
+      // 「生成が引用形式を守れなかった」という生成失敗であり、これをNO_ANSWER_MESSAGEに正規化するのは
+      // 利用者に事実と異なる説明をすることになる（かつ障害が発見しにくくなる）。
+      //
+      // 例外は、モデルが【最重要ルール】3の定型拒否文そのものを返した場合。これはモデル自身が
+      // 「参考資料からは判断できない」と判断した正当な回答であり、生成失敗ではない。
+      if (answerText.startsWith(NO_ANSWER_MESSAGE)) {
         return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
+      }
+
+      if (answerText.length === 0 || usedRefs.length === 0) {
+        // 資料はあり生成も呼ばれたが、有効な引用が得られなかった＝生成失敗（11-30(4)）。
+        return chatError(GENERATION_FAILED_MESSAGE);
       }
 
       const sources = dedupeSources(usedRefs);
