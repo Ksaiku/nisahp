@@ -6,10 +6,10 @@
     { "binding": "VECTORIZE", "index_name": "nisa-fsa-current" }
   ],
   "ai": { "binding": "AI" },
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   "vars": {
     "EMBEDDING_MODEL": "@cf/baai/bge-m3",
     "PRIMARY_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8",
-    "FALLBACK_MODEL": "@cf/meta/llama-3.2-3b-instruct",
     "DOC_VERSION": "2026-09-05",
     "SCORE_THRESHOLD_MIN": 0.62,
     "SCORE_THRESHOLD_ANSWER": 0.67,

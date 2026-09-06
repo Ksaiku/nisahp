@@ -28,7 +28,8 @@ interface Env {
   VECTORIZE: VectorizeIndex;
   EMBEDDING_MODEL: string;
   PRIMARY_MODEL: string;
-  FALLBACK_MODEL: string;
+  // FALLBACK_MODELは11-31で回答経路から廃止した（フォールバック(3B)が資料に無い内容を
+  // 事実であるかのように生成する＝ハルシネーションを起こすことが判明したため）。
   DOC_VERSION: string;
   // 閾値（cosine類似度スコア）。工程4.5〜4.12で実測して確定した値（11-22）。
   // 5-3・付録Bと同じ値を保つこと。変更する場合はここではなく wrangler.jsonc の vars を編集する。
@@ -281,54 +282,52 @@ function extractGeneratedText(result: ChatCompletionResult): ExtractedAnswer | n
   return null;
 }
 
-type ModelUsed = "primary" | "fallback";
+type ModelUsed = "primary";
 
 interface GenerationOutcome {
   text: string | null;
   quotaExceeded: boolean;
-  // 11-30(5)：どちらのモデルが実際に応答を返したかを、後段の診断ログのために保持する。
+  // 11-30(5)：後段の診断ログのために保持する（11-31でモデルはprimary固定になったが、
+  // フィールド自体は診断ログの形式を変えないために残す）。
   modelUsed: ModelUsed | null;
   fieldSource: AnswerFieldSource | null;
 }
 
-// 5-2手順6：回答生成。primary失敗時はfallbackで1回だけ再生成（7-2）。
+// 5-2手順6：回答生成。
+// 11-31：フォールバックモデル（3B）を回答経路から廃止した。検証の結果、フォールバックは
+// 引用[n]自体は正しく出せるが、資料に無い内容（口座開設に必要な書類の具体例、手数料の
+// 金額など）を事実であるかのように生成する＝ハルシネーションを起こすことが判明したため
+// （11-31・設計側の決定）。フォールバックが無ければ「回答の生成に失敗しました」という
+// 正直なエラーになる一方、フォールバックがあると誤った断定を自信満々に返してしまい、
+// 無い方がまだ安全という判断による。
+// 一過性の不調への耐性は、同一モデル（primary）での1回リトライで維持する。
 async function generateAnswer(env: Env, userPrompt: string): Promise<GenerationOutcome> {
   const messages: AiMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: userPrompt },
   ];
 
-  try {
-    const result = (await withTimeout(
-      env.AI.run(env.PRIMARY_MODEL, {
-        messages,
-        temperature: 0.2,
-        max_tokens: 512,
-        // Qwen3の思考モードを無効化（1-4・11-16）。有効のままだと出力トークンが数倍になり
-        // 無料枠の試算（約390問/日）が崩れる。実測でトークン数が約1/10になることを確認済み。
-        chat_template_kwargs: { enable_thinking: false },
-      }),
-      GENERATION_TIMEOUT_MS
-    )) as ChatCompletionResult;
-    const extracted = extractGeneratedText(result);
-    if (extracted) {
-      return { text: extracted.text, quotaExceeded: false, modelUsed: "primary", fieldSource: extracted.fieldSource };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = (await withTimeout(
+        env.AI.run(env.PRIMARY_MODEL, {
+          messages,
+          temperature: 0.2,
+          max_tokens: 512,
+          // Qwen3の思考モードを無効化（1-4・11-16）。有効のままだと出力トークンが数倍になり
+          // 無料枠の試算（約390問/日）が崩れる。実測でトークン数が約1/10になることを確認済み。
+          chat_template_kwargs: { enable_thinking: false },
+        }),
+        GENERATION_TIMEOUT_MS
+      )) as ChatCompletionResult;
+      const extracted = extractGeneratedText(result);
+      if (extracted) {
+        return { text: extracted.text, quotaExceeded: false, modelUsed: "primary", fieldSource: extracted.fieldSource };
+      }
+      // extractedがnull（応答はあったが本文が空）の場合も、次のループでリトライする。
+    } catch (err) {
+      if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true, modelUsed: null, fieldSource: null };
     }
-  } catch (err) {
-    if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true, modelUsed: null, fieldSource: null };
-  }
-
-  try {
-    const result = (await withTimeout(
-      env.AI.run(env.FALLBACK_MODEL, { messages, temperature: 0.2, max_tokens: 512 }),
-      GENERATION_TIMEOUT_MS
-    )) as ChatCompletionResult;
-    const extracted = extractGeneratedText(result);
-    if (extracted) {
-      return { text: extracted.text, quotaExceeded: false, modelUsed: "fallback", fieldSource: extracted.fieldSource };
-    }
-  } catch (err) {
-    if (isQuotaExceededError(err)) return { text: null, quotaExceeded: true, modelUsed: null, fieldSource: null };
   }
 
   return { text: null, quotaExceeded: false, modelUsed: null, fieldSource: null };
