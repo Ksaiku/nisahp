@@ -254,6 +254,16 @@ function dedupeSources(usedRefs: ReferenceChunk[]): SourceEntry[] {
   return Array.from(byUrl.values());
 }
 
+// A-0（requirements-v2.md 2章）：質問文と最終的な応答分類をログに記録する。
+// 「何を聞かれて答えられなかったか」を後から追えるようにするため、
+// 質問の検証が通った後の全ての分岐（成功・拒否・エラー）で1回ずつ呼ぶ。
+// outcomeは要件どおりの4分類（answer/no_answer_threshold/no_answer_scope/error）に加え、
+// LLM自身が【最重要ルール】3に基づき「分からない」と判断したケース（no_answer_llm、
+// 11-30で新設された経路）を区別できるよう追加している。
+function logResponseOutcome(question: string, outcome: string): void {
+  console.log(JSON.stringify({ event: "question_log", question, outcome }));
+}
+
 // 万一モデルが思考タグを本文に混入させた場合の保険的除去（6-3・リスク表#20）。
 function stripThinkTags(text: string): string {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
@@ -376,20 +386,23 @@ export default {
       // 5-2手順2
       const vector = await embedQuestion(env, validated.question);
       if (!vector) {
+        logResponseOutcome(validated.question, "error");
         return chatError("現在、検索の準備でエラーが発生しました。時間をおいて再度お試しください。");
       }
 
       // 5-2手順3
       const matches = await queryVectors(env, vector);
       if (!matches) {
+        logResponseOutcome(validated.question, "error");
         return chatError("現在、検索でエラーが発生しました。時間をおいて再度お試しください。");
       }
 
       // 11-27(1)対応：初回デプロイ直後に観測された一過性の誤動作の再発時に原因を
-      // 追えるよう、工程8のあいだ検索上位3件を記録する。
+      // 追えるよう、工程8のあいだ検索上位3件を記録する。A-0：質問文も併せて記録する。
       console.log(
         JSON.stringify({
           event: "search_top3",
+          question: validated.question,
           top3: matches.slice(0, 3).map((m) => ({ id: m.id, score: m.score })),
         })
       );
@@ -399,6 +412,7 @@ export default {
       const top = matches[0];
       if (top?.metadata?.is_scope_notice === true) {
         const scopeText = String(top.metadata.text ?? "");
+        logResponseOutcome(validated.question, "no_answer_scope");
         return chatResponse(
           {
             answer: `${scopeText} 金融庁のNISA特設サイト（https://www.fsa.go.jp/policy/nisa2/）をご確認ください。`,
@@ -416,6 +430,7 @@ export default {
       const isNoAnswer = matches.length === 0 || adopted.length === 0 || topScore < env.SCORE_THRESHOLD_ANSWER;
 
       if (isNoAnswer) {
+        logResponseOutcome(validated.question, "no_answer_threshold");
         return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
@@ -427,9 +442,11 @@ export default {
       const generation = await generateAnswer(env, userPrompt);
 
       if (generation.quotaExceeded) {
+        logResponseOutcome(validated.question, "error");
         return chatError(QUOTA_EXCEEDED_MESSAGE);
       }
       if (!generation.text) {
+        logResponseOutcome(validated.question, "error");
         return chatError(GENERATION_FAILED_MESSAGE);
       }
 
@@ -465,17 +482,20 @@ export default {
       // 例外は、モデルが【最重要ルール】3の定型拒否文そのものを返した場合。これはモデル自身が
       // 「参考資料からは判断できない」と判断した正当な回答であり、生成失敗ではない。
       if (answerText.startsWith(NO_ANSWER_MESSAGE)) {
+        logResponseOutcome(validated.question, "no_answer_llm");
         return chatResponse({ answer: NO_ANSWER_MESSAGE, sources: [], no_answer: true, error: false }, 200);
       }
 
       if (answerText.length === 0 || usedRefs.length === 0) {
         // 資料はあり生成も呼ばれたが、有効な引用が得られなかった＝生成失敗（11-30(4)）。
+        logResponseOutcome(validated.question, "error");
         return chatError(GENERATION_FAILED_MESSAGE);
       }
 
       const sources = dedupeSources(usedRefs);
 
       // 5-2手順8：応答
+      logResponseOutcome(validated.question, "answer");
       return chatResponse({ answer: answerText, sources, no_answer: false, error: false }, 200);
     }
 
